@@ -297,6 +297,7 @@ final class ChatEngine: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var isGenerating = false
     @Published var activeModelLabel: String = ""
+    @Published var lastCloudError: String = ""
 
     private(set) var started = false
     private var category: Category?
@@ -383,12 +384,14 @@ final class ChatEngine: ObservableObject {
             let text = try await attempt.value
             watchdog.cancel()
             if text.isEmpty {
+                lastCloudError = "云端返回了空内容"
                 return false
             }
             messages[answerIndex].text = text
             return true
         } catch {
             watchdog.cancel()
+            lastCloudError = "\(error) ｜ \(error.localizedDescription)"
             return false
         }
     }
@@ -474,7 +477,7 @@ final class ChatEngine: ObservableObject {
 
         // 所有候选都没生成内容
         if mode == .cloud {
-            messages[answerIndex].text = "云端模型响应超时或暂时不可用。检查网络后再试，或者在上方把模型切到「自动」或「本地」。"
+            messages[answerIndex].text = "云端没答上来。系统给的原话是：\(lastCloudError)\n\n把这段原话截图发我，我对着苹果的错误表确认到底是哪一种。"
         } else if mode == .local {
             messages[answerIndex].text = "本地模型暂时没响应，稍后再试一次。"
         } else {
