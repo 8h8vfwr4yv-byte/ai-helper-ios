@@ -5,6 +5,8 @@ struct ContentView: View {
     @State private var localState: ModelState = ModelState.current()
     @State private var cloudState: CloudState = CloudState.current()
     @AppStorage("modelMode") private var modeRaw: String = ModelMode.auto.rawValue
+    @State private var cloudDisabled = false
+    @State private var cloudFuseTripped = false
 
     private var mode: ModelMode {
         ModelMode(rawValue: modeRaw) ?? .auto
@@ -37,7 +39,20 @@ struct ContentView: View {
                 }
             }
         }
-        .onAppear { refreshStates() }
+        .onAppear {
+            refreshStates()
+            checkCloudCrashFuse()
+        }
+    }
+
+    // 上次云端调用中途闪退 → 自动关闭云端并提示
+    private func checkCloudCrashFuse() {
+        if UserDefaults.standard.bool(forKey: "cloudCallInFlight") {
+            UserDefaults.standard.set(false, forKey: "cloudCallInFlight")
+            UserDefaults.standard.set(true, forKey: "cloudDisabled")
+            cloudFuseTripped = true
+        }
+        cloudDisabled = UserDefaults.standard.bool(forKey: "cloudDisabled")
     }
 
     private func refreshStates() {
@@ -130,6 +145,22 @@ struct ContentView: View {
                     .foregroundStyle(localState.tint)
                 Text(localState.title)
                     .font(.headline)
+            }
+            if cloudDisabled {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Color.orange)
+                    Text(cloudFuseTripped ? "上次云端调用时 App 闪退了，已自动关闭云端，先用本地模型。" : "云端已关闭（之前调用出过问题），先用本地模型。")
+                        .font(.subheadline)
+                    Spacer()
+                    Button("重新启用") {
+                        UserDefaults.standard.set(false, forKey: "cloudDisabled")
+                        cloudDisabled = false
+                        cloudFuseTripped = false
+                    }
+                    .buttonStyle(.glass)
+                    .font(.subheadline.weight(.medium))
+                }
             }
             Text("云端走苹果的 Private Cloud Compute，数据不用于训练、不留存；本地模式全程在设备上处理。")
                 .font(.subheadline)

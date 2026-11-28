@@ -361,6 +361,13 @@ final class ChatEngine: ObservableObject {
         if CloudState.current() != .available {
             return false
         }
+        if UserDefaults.standard.bool(forKey: "cloudDisabled") {
+            return false
+        }
+        // 闪退保险丝：调用前落盘标记，正常返回时清掉；若框架闪退，标记残留，
+        // 下次启动 ContentView 检测到后自动关闭云端，避免反复闪退
+        UserDefaults.standard.set(true, forKey: "cloudCallInFlight")
+        defer { UserDefaults.standard.set(false, forKey: "cloudCallInFlight") }
         let session = self.session(for: .cloud)
         do {
             let text = try await withThrowingTaskGroup(of: String.self) { group in
