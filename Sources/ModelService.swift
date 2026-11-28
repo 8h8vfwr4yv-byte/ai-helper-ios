@@ -349,14 +349,14 @@ final class ChatEngine: ObservableObject {
             localSession = s
             return s
         case .cloud:
-            if let cloudSession { return cloudSession }
-            let s = LanguageModelSession(model: PrivateCloudComputeLanguageModel(), instructions: category.instructions)
-            cloudSession = s
-            return s
+            // 云端会话在 cloudAttempt 里每次新建，这里不该被调用到；兜底返回一个新会话
+            return LanguageModelSession(model: PrivateCloudComputeLanguageModel(), instructions: category.instructions)
         }
     }
 
-    // 云端：整段调用 + 45 秒总超时（非流式，取消语义干净，避免流迭代器竞速）
+    // 云端：整段调用。会话不是线程安全的，必须留在主线程用——
+    // 之前两版把调用塞进任务组子任务（脱离主线程）导致闪退，v2.3 改掉：
+    // 主线程任务 + 看门狗取消实现超时，不再用任务组竞速。
     private func cloudAttempt(question: String, answerIndex: Int) async -> Bool {
         if CloudState.current() != .available {
             return false
@@ -368,26 +368,27 @@ final class ChatEngine: ObservableObject {
         // 下次启动 ContentView 检测到后自动关闭云端，避免反复闪退
         UserDefaults.standard.set(true, forKey: "cloudCallInFlight")
         defer { UserDefaults.standard.set(false, forKey: "cloudCallInFlight") }
-        let session = self.session(for: .cloud)
+
+        guard let category else { return false }
+        // 每次新建会话，用完即弃，避免跨调用复用状态
+        let session = LanguageModelSession(model: PrivateCloudComputeLanguageModel(), instructions: category.instructions)
+        let attempt = Task { @MainActor in
+            try await session.respond(to: question).content
+        }
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(ChatEngine.cloudTimeoutSeconds))
+            attempt.cancel()
+        }
         do {
-            let text = try await withThrowingTaskGroup(of: String.self) { group in
-                group.addTask {
-                    try await session.respond(to: question).content
-                }
-                group.addTask {
-                    try await Task.sleep(for: .seconds(45))
-                    throw StreamTimeout()
-                }
-                let value = try await group.next()!
-                group.cancelAll()
-                return value
-            }
+            let text = try await attempt.value
+            watchdog.cancel()
             if text.isEmpty {
                 return false
             }
             messages[answerIndex].text = text
             return true
         } catch {
+            watchdog.cancel()
             return false
         }
     }

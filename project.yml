@@ -25,5 +25,5 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchStoryboardName: ""
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-        MARKETING_VERSION: "2.2"
-        CURRENT_PROJECT_VERSION: "4"
+        MARKETING_VERSION: "2.3"
+        CURRENT_PROJECT_VERSION: "5"
