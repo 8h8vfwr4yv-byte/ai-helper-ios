@@ -156,66 +156,330 @@ struct Category: Identifiable {
     ]
 }
 
-// MARK: - 对话引擎
+// MARK: - 模型选择（云端 / 本地）
 
-struct ChatMessage: Identifiable {
-    let id = UUID()
-    let isUser: Bool
+enum ModelMode: String, CaseIterable, Identifiable {
+    case auto
+    case cloud
+    case local
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "自动"
+        case .cloud: return "云端"
+        case .local: return "本地"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .auto: return "优先用云端苹果 AI（Private Cloud Compute），超时或不可用时自动切换到本地模型。"
+        case .cloud: return "只用云端苹果 AI 回答，需要联网，回答能力更强。"
+        case .local: return "只用设备上的本地模型回答，不联网、不上传。"
+        }
+    }
+}
+
+enum ModelKind {
+    case cloud
+    case local
+
+    var label: String {
+        switch self {
+        case .cloud: return "云端模型"
+        case .local: return "本地模型"
+        }
+    }
+}
+
+enum CloudState {
+    case available
+    case unavailable
+
+    static func current() -> CloudState {
+        if PrivateCloudComputeLanguageModel().isAvailable {
+            return .available
+        }
+        return .unavailable
+    }
+
+    var title: String {
+        switch self {
+        case .available: return "云端苹果 AI 可用"
+        case .unavailable: return "云端苹果 AI 当前不可用"
+        }
+    }
+}
+
+// MARK: - 历史记录存储
+
+struct ChatMessage: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
+    var isUser: Bool
     var text: String
+    var isNote: Bool = false
+}
+
+struct Conversation: Identifiable, Codable {
+    var id: UUID = UUID()
+    var categoryId: String
+    var title: String
+    var createdAt: Date = Date()
+    var updatedAt: Date = Date()
+    var messages: [ChatMessage] = []
+}
+
+@MainActor
+final class HistoryStore: ObservableObject {
+    @Published var conversations: [Conversation] = []
+
+    private var fileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("conversations.json")
+    }
+
+    init() {
+        load()
+    }
+
+    func load() {
+        guard let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([Conversation].self, from: data) else {
+            conversations = []
+            return
+        }
+        conversations = decoded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(conversations) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
+    func upsert(_ conversation: Conversation) {
+        if let idx = conversations.firstIndex(where: { $0.id == conversation.id }) {
+            conversations[idx] = conversation
+        } else {
+            conversations.append(conversation)
+        }
+        conversations.sort { $0.updatedAt > $1.updatedAt }
+        save()
+    }
+
+    func delete(id: UUID) {
+        conversations.removeAll { $0.id == id }
+        save()
+    }
+
+    func deleteAll() {
+        conversations = []
+        save()
+    }
+
+    func latest(for categoryId: String) -> Conversation? {
+        conversations.first { $0.categoryId == categoryId && !$0.messages.isEmpty }
+    }
+
+    func list(for categoryId: String) -> [Conversation] {
+        conversations.filter { $0.categoryId == categoryId && !$0.messages.isEmpty }
+    }
+}
+
+// MARK: - 对话引擎（云端优先 + 超时回退本地）
+
+private struct StreamTimeout: Error {}
+
+private final class StreamBox: @unchecked Sendable {
+    var iterator: LanguageModelSession.ResponseStream<String>.AsyncIterator
+    init(_ stream: LanguageModelSession.ResponseStream<String>) {
+        iterator = stream.makeAsyncIterator()
+    }
 }
 
 @MainActor
 final class ChatEngine: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var isGenerating = false
-    private(set) var started = false
-    private var session: LanguageModelSession?
+    @Published var activeModelLabel: String = ""
 
-    func start(category: Category) {
-        session = LanguageModelSession(instructions: category.instructions)
-        session?.prewarm()
-        messages = []
+    private(set) var started = false
+    private var category: Category?
+    private weak var store: HistoryStore?
+    private var conversationId: UUID = UUID()
+    private var createdAt: Date = Date()
+    private var localSession: LanguageModelSession?
+    private var cloudSession: LanguageModelSession?
+
+    private static let cloudFirstTokenTimeout: TimeInterval = 20
+
+    func attach(category: Category, store: HistoryStore, resume: Conversation?) {
+        self.category = category
+        self.store = store
+        if let resume {
+            load(resume)
+        } else if let latest = store.latest(for: category.id) {
+            load(latest)
+        } else {
+            startFresh()
+        }
         started = true
     }
 
-    func ask(_ rawQuestion: String) async {
+    func load(_ conversation: Conversation) {
+        conversationId = conversation.id
+        createdAt = conversation.createdAt
+        messages = conversation.messages
+        localSession = nil
+        cloudSession = nil
+    }
+
+    func startFresh() {
+        conversationId = UUID()
+        createdAt = Date()
+        messages = []
+        localSession = nil
+        cloudSession = nil
+    }
+
+    private func session(for kind: ModelKind) -> LanguageModelSession {
+        guard let category else {
+            return LanguageModelSession(instructions: "")
+        }
+        switch kind {
+        case .local:
+            if let localSession { return localSession }
+            let s = LanguageModelSession(model: SystemLanguageModel.default, instructions: category.instructions)
+            s.prewarm()
+            localSession = s
+            return s
+        case .cloud:
+            if let cloudSession { return cloudSession }
+            let s = LanguageModelSession(model: PrivateCloudComputeLanguageModel(), instructions: category.instructions)
+            cloudSession = s
+            return s
+        }
+    }
+
+    private func nextChunk(_ box: StreamBox, timeout: TimeInterval?) async throws -> String? {
+        guard let timeout else {
+            return try await box.iterator.next()?.content
+        }
+        return try await withThrowingTaskGroup(of: String?.self) { group in
+            group.addTask {
+                try await box.iterator.next()?.content
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(timeout))
+                throw StreamTimeout()
+            }
+            let value = try await group.next()!
+            group.cancelAll()
+            return value
+        }
+    }
+
+    // 返回 true 表示已生成内容；false 表示一个字都没生成（可回退）
+    private func streamAttempt(kind: ModelKind, question: String, answerIndex: Int) async -> Bool {
+        let session = self.session(for: kind)
+        let box = StreamBox(session.streamResponse(to: question))
+        var gotAny = false
+        do {
+            while true {
+                let timeout: TimeInterval? = (kind == .cloud && !gotAny) ? ChatEngine.cloudFirstTokenTimeout : nil
+                guard let content = try await nextChunk(box, timeout: timeout) else { break }
+                gotAny = true
+                messages[answerIndex].text = content
+            }
+        } catch {
+            if !gotAny {
+                return false
+            }
+            messages[answerIndex].text += "\n\n（回答中途中断了）"
+            return true
+        }
+        return gotAny
+    }
+
+    func ask(_ rawQuestion: String, mode: ModelMode) async {
         let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
         if question.isEmpty || isGenerating {
             return
         }
-        guard let session = session else {
-            return
+        let localOK = ModelState.current() == .available
+        let cloudOK = CloudState.current() == .available
+
+        var order: [ModelKind] = []
+        switch mode {
+        case .auto:
+            if cloudOK { order.append(.cloud) }
+            if localOK { order.append(.local) }
+        case .cloud:
+            order = [.cloud]
+        case .local:
+            order = [.local]
         }
+
         messages.append(ChatMessage(isUser: true, text: question))
         isGenerating = true
         messages.append(ChatMessage(isUser: false, text: ""))
         let answerIndex = messages.count - 1
-        do {
-            let stream: LanguageModelSession.ResponseStream<String> = session.streamResponse(to: question)
-            for try await partial in stream {
-                messages[answerIndex].text = partial.content
+
+        if order.isEmpty {
+            messages[answerIndex].text = "现在云端和本地模型都不可用。检查一下网络，或去「设置 → Apple 智能与 Siri」确认 Apple 智能已开启。"
+            isGenerating = false
+            persist()
+            return
+        }
+
+        var fellBack = false
+        for (index, kind) in order.enumerated() {
+            let ok = await streamAttempt(kind: kind, question: question, answerIndex: answerIndex)
+            if ok {
+                activeModelLabel = kind.label
+                if fellBack {
+                    messages.insert(
+                        ChatMessage(isUser: false, text: "云端模型响应超时，已自动切换到本地模型回答", isNote: true),
+                        at: answerIndex
+                    )
+                }
+                isGenerating = false
+                persist()
+                return
             }
-            if messages[answerIndex].text.isEmpty {
-                messages[answerIndex].text = "没有生成内容，换个问法试试。"
+            if index < order.count - 1 {
+                fellBack = true
+                messages[answerIndex].text = ""
+                if kind == .cloud { cloudSession = nil }
+                if kind == .local { localSession = nil }
             }
-        } catch let error as LanguageModelSession.GenerationError {
-            messages[answerIndex].text = ChatEngine.friendlyMessage(for: error)
-        } catch {
-            messages[answerIndex].text = "出错了：\(error.localizedDescription)"
+        }
+
+        // 所有候选都没生成内容
+        if mode == .cloud {
+            messages[answerIndex].text = "云端模型响应超时或暂时不可用。检查网络后再试，或者在上方把模型切到「自动」或「本地」。"
+        } else if mode == .local {
+            messages[answerIndex].text = "本地模型暂时没响应，稍后再试一次。"
+        } else {
+            messages[answerIndex].text = "云端和本地模型都没能响应，稍后再试一次。"
         }
         isGenerating = false
+        persist()
     }
 
-    static func friendlyMessage(for error: LanguageModelSession.GenerationError) -> String {
-        switch error {
-        case .guardrailViolation:
-            return "这个问题触发了苹果 AI 的安全限制，没法回答。换个问法，或者问点别的吧。"
-        case .exceededContextWindowSize:
-            return "这次对话太长了，超出了本地模型的记忆范围。点右上角按钮重新开始一次新对话吧。"
-        case .unsupportedLanguageOrLocale:
-            return "本地模型暂时不支持当前的语言或地区设置。"
-        default:
-            return "生成失败：\(error.localizedDescription)"
-        }
+    private func persist() {
+        guard let category, let store else { return }
+        let firstQuestion = messages.first(where: { $0.isUser })?.text ?? "新对话"
+        let conversation = Conversation(
+            id: conversationId,
+            categoryId: category.id,
+            title: String(firstQuestion.prefix(30)),
+            createdAt: createdAt,
+            updatedAt: Date(),
+            messages: messages
+        )
+        store.upsert(conversation)
     }
 }
