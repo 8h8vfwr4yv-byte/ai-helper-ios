@@ -292,13 +292,6 @@ final class HistoryStore: ObservableObject {
 
 private struct StreamTimeout: Error {}
 
-private final class StreamBox: @unchecked Sendable {
-    var iterator: LanguageModelSession.ResponseStream<String>.AsyncIterator
-    init(_ stream: LanguageModelSession.ResponseStream<String>) {
-        iterator = stream.makeAsyncIterator()
-    }
-}
-
 @MainActor
 final class ChatEngine: ObservableObject {
     @Published var messages: [ChatMessage] = []
@@ -313,7 +306,7 @@ final class ChatEngine: ObservableObject {
     private var localSession: LanguageModelSession?
     private var cloudSession: LanguageModelSession?
 
-    private static let cloudFirstTokenTimeout: TimeInterval = 20
+    private static let cloudTimeoutSeconds: TimeInterval = 45
 
     func attach(category: Category, store: HistoryStore, resume: Conversation?) {
         self.category = category
@@ -363,35 +356,44 @@ final class ChatEngine: ObservableObject {
         }
     }
 
-    private func nextChunk(_ box: StreamBox, timeout: TimeInterval?) async throws -> String? {
-        guard let timeout else {
-            return try await box.iterator.next()?.content
+    // 云端：整段调用 + 45 秒总超时（非流式，取消语义干净，避免流迭代器竞速）
+    private func cloudAttempt(question: String, answerIndex: Int) async -> Bool {
+        if CloudState.current() != .available {
+            return false
         }
-        return try await withThrowingTaskGroup(of: String?.self) { group in
-            group.addTask {
-                try await box.iterator.next()?.content
+        let session = self.session(for: .cloud)
+        do {
+            let text = try await withThrowingTaskGroup(of: String.self) { group in
+                group.addTask {
+                    try await session.respond(to: question).content
+                }
+                group.addTask {
+                    try await Task.sleep(for: .seconds(45))
+                    throw StreamTimeout()
+                }
+                let value = try await group.next()!
+                group.cancelAll()
+                return value
             }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeout))
-                throw StreamTimeout()
+            if text.isEmpty {
+                return false
             }
-            let value = try await group.next()!
-            group.cancelAll()
-            return value
+            messages[answerIndex].text = text
+            return true
+        } catch {
+            return false
         }
     }
 
-    // 返回 true 表示已生成内容；false 表示一个字都没生成（可回退）
-    private func streamAttempt(kind: ModelKind, question: String, answerIndex: Int) async -> Bool {
-        let session = self.session(for: kind)
-        let box = StreamBox(session.streamResponse(to: question))
+    // 本地：流式输出
+    private func localAttempt(question: String, answerIndex: Int) async -> Bool {
+        let session = self.session(for: .local)
         var gotAny = false
         do {
-            while true {
-                let timeout: TimeInterval? = (kind == .cloud && !gotAny) ? ChatEngine.cloudFirstTokenTimeout : nil
-                guard let content = try await nextChunk(box, timeout: timeout) else { break }
+            let stream: LanguageModelSession.ResponseStream<String> = session.streamResponse(to: question)
+            for try await partial in stream {
                 gotAny = true
-                messages[answerIndex].text = content
+                messages[answerIndex].text = partial.content
             }
         } catch {
             if !gotAny {
@@ -436,7 +438,12 @@ final class ChatEngine: ObservableObject {
 
         var fellBack = false
         for (index, kind) in order.enumerated() {
-            let ok = await streamAttempt(kind: kind, question: question, answerIndex: answerIndex)
+            let ok: Bool
+            if kind == .cloud {
+                ok = await cloudAttempt(question: question, answerIndex: answerIndex)
+            } else {
+                ok = await localAttempt(question: question, answerIndex: answerIndex)
+            }
             if ok {
                 activeModelLabel = kind.label
                 if fellBack {
